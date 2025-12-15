@@ -1,0 +1,42 @@
+# Dockerfile.custom - Imagen personalizada con ERPNext + HRMS
+# Construye una imagen con Frappe, ERPNext y HRMS preinstalados
+
+ARG ERPNEXT_VERSION=v15.81.3
+FROM frappe/erpnext:${ERPNEXT_VERSION}
+
+# Cambiar a usuario root para instalar dependencias del sistema
+USER root
+
+# Instalar git (necesario para bench get-app)
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+
+# Volver al usuario frappe
+USER frappe
+
+# Establecer directorio de trabajo
+WORKDIR /home/frappe/frappe-bench
+
+# Crear common_site_config.json temporal (necesario para build de HRMS)
+RUN mkdir -p /home/frappe/frappe-bench/sites && \
+    echo '{"socketio_port": 9000}' > /home/frappe/frappe-bench/sites/common_site_config.json
+
+# Descargar HRMS sin construir assets
+# Usamos version-15 que es compatible con ERPNext v15
+RUN bench get-app hrms --branch version-15 --skip-assets
+
+# Verificar que HRMS se descargó correctamente
+RUN ls -la /home/frappe/frappe-bench/apps/ && \
+    echo "HRMS descargado correctamente"
+
+# Instalar dependencias Python de HRMS
+RUN /home/frappe/frappe-bench/env/bin/pip install -e /home/frappe/frappe-bench/apps/hrms
+
+# Construir assets de HRMS con límite de memoria aumentado
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+RUN bench build --app hrms
+
+# Eliminar config temporal (será recreado por el configurator en runtime)
+RUN rm -f /home/frappe/frappe-bench/sites/common_site_config.json
+
+# Verificar apps disponibles
+RUN echo "Apps disponibles:" && ls /home/frappe/frappe-bench/apps/
