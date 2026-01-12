@@ -1,14 +1,29 @@
-# Dockerfile.custom - Imagen personalizada con ERPNext + HRMS
+# =============================================================================
+# Dockerfile.erpnext_with_hrms - Imagen Multi-etapa Optimizada
+# =============================================================================
 # Construye una imagen con Frappe, ERPNext y HRMS preinstalados
+# Optimizada para producción con construcción multi-etapa
+# =============================================================================
 
 ARG ERPNEXT_VERSION=v15.81.3
-FROM frappe/erpnext:${ERPNEXT_VERSION}
+ARG HRMS_BRANCH=version-15
+
+# =============================================================================
+# STAGE 1: Builder - Descarga apps y construye assets
+# =============================================================================
+FROM frappe/erpnext:${ERPNEXT_VERSION} AS builder
 
 # Cambiar a usuario root para instalar dependencias del sistema
 USER root
 
-# Instalar git (necesario para bench get-app)
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+# Instalar git y herramientas de build
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git \
+        build-essential \
+        python3-dev && \
+    rm -rf /var/lib/apt/lists/* && \
+    apt-get clean
 
 # Volver al usuario frappe
 USER frappe
@@ -21,22 +36,60 @@ RUN mkdir -p /home/frappe/frappe-bench/sites && \
     echo '{"socketio_port": 9000}' > /home/frappe/frappe-bench/sites/common_site_config.json
 
 # Descargar HRMS sin construir assets
-# Usamos version-15 que es compatible con ERPNext v15
-RUN bench get-app hrms --branch version-15 --skip-assets
-
-# Verificar que HRMS se descargó correctamente
-RUN ls -la /home/frappe/frappe-bench/apps/ && \
-    echo "HRMS descargado correctamente"
+ARG HRMS_BRANCH
+RUN bench get-app hrms --branch ${HRMS_BRANCH} --skip-assets && \
+    echo "HRMS descargado correctamente desde branch ${HRMS_BRANCH}"
 
 # Instalar dependencias Python de HRMS
-RUN /home/frappe/frappe-bench/env/bin/pip install -e /home/frappe/frappe-bench/apps/hrms
+RUN /home/frappe/frappe-bench/env/bin/pip install --no-cache-dir -e /home/frappe/frappe-bench/apps/hrms
 
 # Construir assets de HRMS con límite de memoria aumentado
 ENV NODE_OPTIONS="--max-old-space-size=4096"
-RUN bench build --app hrms
+RUN bench build --app hrms && \
+    echo "Assets de HRMS construidos correctamente"
 
-# Eliminar config temporal (será recreado por el configurator en runtime)
-RUN rm -f /home/frappe/frappe-bench/sites/common_site_config.json
+# Limpiar archivos temporales y caché para reducir tamaño
+RUN rm -rf /home/frappe/frappe-bench/sites/common_site_config.json && \
+    rm -rf /home/frappe/.cache && \
+    rm -rf /home/frappe/frappe-bench/apps/hrms/.git && \
+    find /home/frappe/frappe-bench -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true && \
+    find /home/frappe/frappe-bench -type d -name "node_modules" -path "*/test/*" -exec rm -rf {} + 2>/dev/null || true
 
-# Verificar apps disponibles
-RUN echo "Apps disponibles:" && ls /home/frappe/frappe-bench/apps/
+# =============================================================================
+# STAGE 2: Production - Imagen final optimizada
+# =============================================================================
+FROM frappe/erpnext:${ERPNEXT_VERSION} AS production
+
+# Metadata
+LABEL maintainer="Kimen <jcadriaz@gmail.com>"
+LABEL description="ERPNext with HRMS pre-installed"
+LABEL version="${ERPNEXT_VERSION}"
+
+# Copiar apps instaladas desde builder
+COPY --from=builder --chown=frappe:frappe /home/frappe/frappe-bench/apps/hrms /home/frappe/frappe-bench/apps/hrms
+
+# Copiar assets construidos
+COPY --from=builder --chown=frappe:frappe /home/frappe/frappe-bench/sites/assets /home/frappe/frappe-bench/sites/assets
+
+# Copiar entorno Python con dependencias instaladas
+COPY --from=builder --chown=frappe:frappe /home/frappe/frappe-bench/env /home/frappe/frappe-bench/env
+
+# Establecer directorio de trabajo
+WORKDIR /home/frappe/frappe-bench
+
+# Usuario frappe para ejecución
+USER frappe
+
+# Variables de entorno para producción
+ENV NODE_ENV=production
+ENV FRAPPE_PORT=8080
+
+# Verificar instalación
+RUN echo "=== Apps disponibles ===" && \
+    ls -la /home/frappe/frappe-bench/apps/ && \
+    echo "=== Verificando HRMS ===" && \
+    test -d /home/frappe/frappe-bench/apps/hrms && echo "HRMS: OK" || echo "HRMS: MISSING"
+
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/api/method/frappe.ping || exit 1
